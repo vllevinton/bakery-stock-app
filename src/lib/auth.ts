@@ -1,7 +1,13 @@
 import jwt from "jsonwebtoken";
 import { cookies } from "next/headers";
 
-export type SessionUser = { id: number; username: string; role: "EMPLEADO" | "OWNER"; email?: string | null };
+export type SessionUser = {
+  id: number;
+  username: string;
+  role: "EMPLEADO" | "OWNER";
+  email?: string | null;
+  branch_id?: number | null; // ✅ NUEVO
+};
 
 const COOKIE_NAME = "panaderia_session";
 
@@ -18,7 +24,7 @@ export function setSessionCookie(user: SessionUser) {
     sameSite: "lax",
     secure: process.env.NODE_ENV === "production",
     path: "/",
-    maxAge: 60 * 60 * 24 * 7
+    maxAge: 60 * 60 * 24 * 7,
   });
 }
 

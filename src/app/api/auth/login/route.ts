@@ -13,14 +13,23 @@ export async function POST(req: Request) {
   }
 
   const db = getDb();
-  const user = db.prepare("SELECT id, username, password_hash, role, email FROM users WHERE username = ?").get(username) as any;
+  const user = db
+    .prepare("SELECT id, username, password_hash, role, email, branch_id FROM users WHERE username = ?")
+    .get(username) as any;
 
   if (!user) return NextResponse.json({ error: "Credenciales inválidas" }, { status: 401 });
 
   const ok = bcrypt.compareSync(password, user.password_hash);
   if (!ok) return NextResponse.json({ error: "Credenciales inválidas" }, { status: 401 });
 
-  setSessionCookie({ id: user.id, username: user.username, role: user.role, email: user.email });
+  // ✅ Guardar branch_id en sesión
+  setSessionCookie({
+    id: user.id,
+    username: user.username,
+    role: user.role,
+    email: user.email,
+    branch_id: user.branch_id ?? null,
+  });
 
   const redirectTo = user.role === "OWNER" ? "/owner/dashboard" : "/empleado/stock";
   return NextResponse.json({ redirectTo });
