@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: light; }
+
+body { @apply bg-brand-50 text-slate-900; }
+
+.bg-login {
+  background:
+    radial-gradient(1200px 600px at 70% 20%, rgba(168,107,69,0.25), transparent 60%),
+    radial-gradient(900px 500px at 20% 80%, rgba(200,142,107,0.22), transparent 55%),
+    linear-gradient(180deg, rgba(60,36,26,0.55), rgba(60,36,26,0.55));
+}
+
+.card { @apply bg-white rounded-2xl shadow-sm border border-slate-200; }
