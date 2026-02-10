@@ -4,29 +4,29 @@ import { OwnerTabs } from "@/components/OwnerTabs";
 import { Sparkline } from "@/components/Sparkline";
 import { headers } from "next/headers";
 
-async function getSummary() {
-  const h = headers();
+function parseBranchId(raw: any): 1 | 2 | 3 {
+  const n = Number(String(raw ?? "").trim());
+  if (n === 1 || n === 2 || n === 3) return n;
+  return 1;
+}
 
-  // Detecta host real (localhost:3000) y protocolo
+async function getSummary(branchId: 1 | 2 | 3) {
+  const h = headers();
   const host = h.get("x-forwarded-host") ?? h.get("host");
   const proto = h.get("x-forwarded-proto") ?? "http";
 
-  if (!host) {
-    throw new Error("No se pudo determinar el host para construir la URL.");
-  }
+  if (!host) throw new Error("No se pudo determinar el host para construir la URL.");
 
-  const url = `${proto}://${host}/api/summary`;
+  const url = `${proto}://${host}/api/summary?branchId=${branchId}`;
 
   const res = await fetch(url, {
     cache: "no-store",
     credentials: "include",
     headers: {
-      // Forward cookies para que /api/summary vea la sesión del owner
       cookie: h.get("cookie") ?? "",
     },
   });
 
-  // Si algo falla, devolvemos info clara en vez de romper con undefined
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
     throw new Error(`Error /api/summary (${res.status}): ${txt}`);
@@ -35,16 +35,23 @@ async function getSummary() {
   return res.json();
 }
 
-export default async function OwnerDashboard() {
+export default async function OwnerDashboard({
+  searchParams,
+}: {
+  searchParams?: { branchId?: string };
+}) {
   requireRole("OWNER");
-  const data = await getSummary();
+
+  const branchId = parseBranchId(searchParams?.branchId);
+  const data = await getSummary(branchId);
 
   return (
     <div className="min-h-screen">
       <Topbar title="Panel de Control" />
       <div className="mx-auto max-w-6xl px-4 py-8">
         <div className="mb-6">
-          <OwnerTabs active="dashboard" />
+          {/* IMPORTANTÍSIMO: OwnerTabs tiene que preservar branchId en los links */}
+          <OwnerTabs active="dashboard" branchId={branchId} />
         </div>
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
