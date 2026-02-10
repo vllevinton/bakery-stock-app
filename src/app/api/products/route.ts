@@ -3,7 +3,7 @@ import { getDb, nowIso } from "@/lib/db";
 import { getSessionUser } from "@/lib/auth";
 
 function todayYMD() {
-  return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+  return new Date().toISOString().slice(0, 10);
 }
 
 function normalizeYmdOrNull(v: any): string | null {
@@ -13,12 +13,24 @@ function normalizeYmdOrNull(v: any): string | null {
   return s;
 }
 
-function parseBranchId(raw: string | null): number | null {
-  if (!raw) return null;
-  const n = Number(raw);
+function parseBranchId(raw: any): 1 | 2 | 3 | null {
+  const s = String(raw ?? "").trim();
+  if (!s) return null;
+  const n = Number(s);
   if (!Number.isFinite(n)) return null;
   if (n !== 1 && n !== 2 && n !== 3) return null;
-  return n;
+  return n as 1 | 2 | 3;
+}
+
+function normalizeActive(v: any, fallback: number) {
+  if (v === undefined || v === null) return fallback;
+  if (typeof v === "boolean") return v ? 1 : 0;
+  const s = String(v).trim().toLowerCase();
+  if (s === "1" || s === "true") return 1;
+  if (s === "0" || s === "false") return 0;
+  const n = Number(v);
+  if (!Number.isNaN(n)) return n ? 1 : 0;
+  return fallback;
 }
 
 function autoInactivateExpiredBranchProducts(db: ReturnType<typeof getDb>, branchId: number) {
@@ -36,119 +48,88 @@ function autoInactivateExpiredBranchProducts(db: ReturnType<typeof getDb>, branc
   `).run(now, branchId, today);
 }
 
+function sessionBranchId(user: any): number | null {
+  // soporta sesiones viejas/nuevas
+  const b1 = typeof user?.branchId === "number" ? user.branchId : null;
+  const b2 = typeof user?.branch_id === "number" ? user.branch_id : null;
+  return b1 ?? b2;
+}
+
 export async function GET(req: Request) {
   const user = getSessionUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const url = new URL(req.url);
-  const activeParam = url.searchParams.get("active"); // "1" | null
-  const branchParam = url.searchParams.get("branchId"); // owner selector
+  const activeParam = url.searchParams.get("active"); // "1" => solo visibles
+  const branchParam = url.searchParams.get("branchId");
+
   const db = getDb();
   const today = todayYMD();
 
-  // ---- Resolver branchId según rol ----
+  // Resolver branchId por rol
   let branchId: number | null = null;
 
   if (user.role === "EMPLEADO") {
-    // para empleados, la sucursal sale del usuario
-    // (si no está seteada, es un problema de datos)
-    // @ts-ignore
-    branchId = typeof user.branch_id === "number" ? user.branch_id : null;
+    branchId = sessionBranchId(user);
     if (!branchId) {
       return NextResponse.json({ error: "Empleado sin sucursal asignada (branch_id)" }, { status: 400 });
     }
   } else {
-    // owner: elige sucursal por query, default 1 si no manda nada
     branchId = parseBranchId(branchParam) ?? 1;
   }
 
-  // 1) auto-inactivar vencidos SOLO para esta sucursal
   autoInactivateExpiredBranchProducts(db, branchId);
 
-  // 2) EMPLEADO: solo “visibles” (activos + vigentes por fechas)
+  const baseSelect = `
+    SELECT
+      p.id as id,
+      p.product_code,
+      p.name,
+      p.category,
+
+      bp.current_stock_packs,
+      bp.margin_minimum_packs,
+      bp.active,
+      bp.start_date,
+      bp.end_date,
+
+      p.lead_time_days,
+      p.units_per_pack,
+      p.min_packs_order
+    FROM branch_products bp
+    JOIN products p ON p.id = bp.product_id
+    WHERE bp.branch_id = ?
+  `;
+
+  // EMPLEADO: siempre visibles (active + fechas)
   if (user.role === "EMPLEADO") {
-    const rows = db.prepare(
-      `
-      SELECT
-        p.id as id,
-        p.product_code,
-        p.name,
-        p.category,
-        bp.current_stock_packs,
-        bp.margin_minimum_packs,
-        p.lead_time_days,
-        p.units_per_pack,
-        p.min_packs_order,
-        bp.active,
-        bp.start_date,
-        bp.end_date,
-        bp.updated_at,
-        p.created_at
-      FROM branch_products bp
-      JOIN products p ON p.id = bp.product_id
-      WHERE bp.branch_id = ?
+    const rows = db.prepare(`
+      ${baseSelect}
         AND bp.active = 1
         AND (bp.start_date IS NULL OR bp.start_date = '' OR bp.start_date <= ?)
         AND (bp.end_date   IS NULL OR bp.end_date   = '' OR bp.end_date   >= ?)
       ORDER BY p.name ASC
-      `
-    ).all(branchId, today, today);
+    `).all(branchId, today, today);
 
     return NextResponse.json({ products: rows, branchId });
   }
 
-  // 3) OWNER: ve TODO por defecto, o solo “activos vigentes” si ?active=1
+  // OWNER:
+  // - si active=1 => visibles (active + fechas)
+  // - si no => todo de la sucursal
   const rows =
     activeParam === "1"
-      ? db.prepare(
-          `
-          SELECT
-            p.id as id,
-            p.product_code,
-            p.name,
-            p.category,
-            bp.current_stock_packs,
-            bp.margin_minimum_packs,
-            p.lead_time_days,
-            p.units_per_pack,
-            p.min_packs_order,
-            bp.active,
-            bp.start_date,
-            bp.end_date,
-            bp.updated_at,
-            p.created_at
-          FROM branch_products bp
-          JOIN products p ON p.id = bp.product_id
-          WHERE bp.branch_id = ?
+      ? db.prepare(`
+          ${baseSelect}
             AND bp.active = 1
             AND (bp.start_date IS NULL OR bp.start_date = '' OR bp.start_date <= ?)
             AND (bp.end_date   IS NULL OR bp.end_date   = '' OR bp.end_date   >= ?)
           ORDER BY p.name ASC
-          `
-        ).all(branchId, today, today)
-      : db.prepare(
-          `
-          SELECT
-            p.id as id,
-            p.product_code,
-            p.name,
-            p.category,
-            bp.current_stock_packs,
-            bp.margin_minimum_packs,
-            p.lead_time_days,
-            p.units_per_pack,
-            p.min_packs_order,
-            bp.active,
-            bp.start_date,
-            bp.end_date,
-            bp.updated_at,
-            p.created_at
-          FROM branch_products bp
-          JOIN products p ON p.id = bp.product_id
-          WHERE bp.branch_id = ?
+        `).all(branchId, today, today)
+      : db.prepare(`
+          ${baseSelect}
           ORDER BY p.name ASC
-          `
-        ).all(branchId);
+        `).all(branchId);
 
   return NextResponse.json({ products: rows, branchId });
 }
@@ -159,68 +140,61 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
+  const url = new URL(req.url);
   const body = await req.json().catch(() => ({}));
+
+  const branchId = parseBranchId(url.searchParams.get("branchId")) ?? parseBranchId(body.branchId) ?? 1;
+
+  const db = getDb();
   const now = nowIso();
   const today = todayYMD();
-
-  // El owner puede mandar branchId en query o body (para setear defaults de esa sucursal)
-  // Si no manda nada, usamos 1
-  // (esto NO limita: luego lo puede activar/desactivar por sucursal)
-  const url = new URL(req.url);
-  const branchId = parseBranchId(url.searchParams.get("branchId")) ?? parseBranchId(String(body.branchId ?? "")) ?? 1;
 
   const product_code = String(body.product_code || "").trim().toUpperCase();
   const name = String(body.name || "").trim();
   const category = String(body.category || "Otros").trim();
 
-  // Defaults (para la sucursal seleccionada)
-  const current_stock_packs = Math.max(0, Math.floor(Number(body.current_stock_packs ?? 0)));
-  const margin_minimum_packs = Math.max(0, Math.floor(Number(body.margin_minimum_packs ?? 0)));
+  // Catálogo
   const lead_time_days = Math.max(0, Math.floor(Number(body.lead_time_days ?? 1)));
   const units_per_pack = Math.max(1, Math.floor(Number(body.units_per_pack ?? 1)));
   const min_packs_order = Math.max(1, Math.floor(Number(body.min_packs_order ?? 1)));
 
+  // Por sucursal
+  const current_stock_packs = Math.max(0, Math.floor(Number(body.current_stock_packs ?? 0)));
+  const margin_minimum_packs = Math.max(0, Math.floor(Number(body.margin_minimum_packs ?? 0)));
   const start_date = normalizeYmdOrNull(body.start_date);
   const end_date = normalizeYmdOrNull(body.end_date);
-
-  if (start_date && end_date && start_date > end_date) {
-    return NextResponse.json({ error: "La fecha de inicio no puede ser mayor a la fecha de fin" }, { status: 400 });
-  }
-
-  // active por sucursal (default 0 para no aparecer hasta que el owner lo active)
-  // Si vos preferís que nazca activo en la sucursal elegida, dejalo en 1.
-  let active = body.active === undefined ? 0 : (String(body.active) === "0" || body.active === false ? 0 : 1);
-  if (end_date && end_date < today) active = 0;
 
   if (!product_code || !name) {
     return NextResponse.json({ error: "Código y nombre son obligatorios" }, { status: 400 });
   }
+  if (start_date && end_date && start_date > end_date) {
+    return NextResponse.json({ error: "La fecha de inicio no puede ser mayor a la fecha de fin" }, { status: 400 });
+  }
 
-  const db = getDb();
+  let active = normalizeActive(body.active, 1);
+  if (end_date && end_date < today) active = 0;
 
   try {
     const tx = db.transaction(() => {
-      // 1) Insertar en catálogo (products)
+      // 1) Insert catálogo (products)
       const info = db.prepare(`
         INSERT INTO products
-        (
-          product_code, name, category,
-          current_stock_packs, margin_minimum_packs, lead_time_days,
-          units_per_pack, min_packs_order,
-          active, start_date, end_date,
-          created_at, updated_at
-        )
+          (product_code, name, category,
+           current_stock_packs, margin_minimum_packs,
+           lead_time_days, units_per_pack, min_packs_order,
+           active, start_date, end_date,
+           created_at, updated_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
       `).run(
         product_code,
         name,
         category,
-        0, // catalog stock NO se usa más (se usa por sucursal), lo dejamos en 0
-        0, // catalog margin idem
+        0, // ya no se usa global
+        0, // ya no se usa global
         lead_time_days,
         units_per_pack,
         min_packs_order,
-        1, // catalog siempre "activo" como ítem del catálogo; la visibilidad real es por sucursal
+        1,   // el item existe en catálogo
         null,
         null,
         now,
@@ -229,7 +203,7 @@ export async function POST(req: Request) {
 
       const productId = Number(info.lastInsertRowid);
 
-      // 2) Crear registros por sucursal en branch_products (por defecto inactivos)
+      // 2) Crear branch_products para las 3 sucursales
       const branches = db.prepare("SELECT id FROM branches ORDER BY id ASC").all() as any[];
 
       const ins = db.prepare(`
@@ -248,7 +222,7 @@ export async function POST(req: Request) {
           isSelected ? start_date : null,
           isSelected ? end_date : null,
           isSelected ? current_stock_packs : 0,
-          isSelected ? margin_minimum_packs : margin_minimum_packs, // podés dejar 0 si preferís
+          isSelected ? margin_minimum_packs : 0,
           now
         );
       }
@@ -257,7 +231,7 @@ export async function POST(req: Request) {
     });
 
     const id = tx();
-    return NextResponse.json({ id });
+    return NextResponse.json({ id, branchId });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || "Error" }, { status: 400 });
   }

@@ -20,7 +20,9 @@
     "ignoreDeprecations": "6.0",
 
     "types": [
-      "node"
+      "node",
+      "react",
+      "react-dom"
     ],
     "baseUrl": ".",
     "paths": {

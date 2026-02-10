@@ -3,7 +3,7 @@ import { getDb, nowIso } from "@/lib/db";
 import { getSessionUser } from "@/lib/auth";
 
 function todayYMD() {
-  return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+  return new Date().toISOString().slice(0, 10);
 }
 
 function normalizeYmdOrNull(v: any): string | null {
@@ -13,7 +13,16 @@ function normalizeYmdOrNull(v: any): string | null {
   return s;
 }
 
-function normalizeActive(v: any, fallback: number): number {
+function parseBranchId(raw: any): 1 | 2 | 3 | null {
+  const s = String(raw ?? "").trim();
+  if (!s) return null;
+  const n = Number(s);
+  if (!Number.isFinite(n)) return null;
+  if (n !== 1 && n !== 2 && n !== 3) return null;
+  return n as 1 | 2 | 3;
+}
+
+function normalizeActive(v: any, fallback: number) {
   if (v === undefined || v === null) return fallback;
   if (typeof v === "boolean") return v ? 1 : 0;
   const s = String(v).trim().toLowerCase();
@@ -22,29 +31,6 @@ function normalizeActive(v: any, fallback: number): number {
   const n = Number(v);
   if (!Number.isNaN(n)) return n ? 1 : 0;
   return fallback;
-}
-
-function parseBranchId(raw: string | null): number | null {
-  if (!raw) return null;
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return null;
-  if (n !== 1 && n !== 2 && n !== 3) return null;
-  return n;
-}
-
-function ensureBranchProductRow(db: ReturnType<typeof getDb>, branchId: number, productId: number) {
-  const now = nowIso();
-  const existing = db
-    .prepare("SELECT 1 FROM branch_products WHERE branch_id = ? AND product_id = ?")
-    .get(branchId, productId) as any;
-
-  if (existing) return;
-
-  db.prepare(`
-    INSERT INTO branch_products
-      (branch_id, product_id, active, start_date, end_date, current_stock_packs, margin_minimum_packs, updated_at)
-    VALUES (?,?,?,?,?,?,?,?)
-  `).run(branchId, productId, 0, null, null, 0, 0, now);
 }
 
 function autoInactivateExpiredBranchProducts(db: ReturnType<typeof getDb>, branchId: number) {
@@ -64,76 +50,69 @@ function autoInactivateExpiredBranchProducts(db: ReturnType<typeof getDb>, branc
 
 export async function PUT(req: Request, { params }: { params: { id: string } }) {
   const user = getSessionUser();
-  if (!user || user.role !== "OWNER") return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  if (!user || user.role !== "OWNER") {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
 
   const productId = Number(params.id);
-  if (!Number.isFinite(productId)) return NextResponse.json({ error: "Bad id" }, { status: 400 });
+  if (!Number.isFinite(productId)) {
+    return NextResponse.json({ error: "Bad id" }, { status: 400 });
+  }
+
+  const url = new URL(req.url);
+  const body = await req.json().catch(() => ({}));
+
+  const branchId =
+    parseBranchId(url.searchParams.get("branchId")) ??
+    parseBranchId(body.branchId) ??
+    1;
 
   const db = getDb();
-  const body = await req.json().catch(() => ({}));
   const now = nowIso();
   const today = todayYMD();
 
-  // branchId: por query o body; default 1 si no viene
-  const url = new URL(req.url);
-  const branchId =
-    parseBranchId(url.searchParams.get("branchId")) ??
-    parseBranchId(String(body.branchId ?? "")) ??
-    1;
-
-  // Auto-inactivar vencidos de ESA sucursal antes de operar
   autoInactivateExpiredBranchProducts(db, branchId);
 
-  const existingProduct = db.prepare("SELECT * FROM products WHERE id = ?").get(productId) as any;
-  if (!existingProduct) return NextResponse.json({ error: "Not found" }, { status: 404 });
+  const prod = db.prepare("SELECT * FROM products WHERE id = ?").get(productId) as any;
+  if (!prod) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  // Garantiza que exista el row por sucursal
-  ensureBranchProductRow(db, branchId, productId);
-
-  const existingBP = db
+  const bp = db
     .prepare("SELECT * FROM branch_products WHERE branch_id = ? AND product_id = ?")
     .get(branchId, productId) as any;
+  if (!bp) return NextResponse.json({ error: "Not found (branch_products)" }, { status: 404 });
 
-  // -------------------------
-  // 1) Actualizar catálogo (products)
-  // -------------------------
-  const product_code = String(body.product_code ?? existingProduct.product_code).trim().toUpperCase();
-  const name = String(body.name ?? existingProduct.name).trim();
-  const category = String(body.category ?? existingProduct.category).trim();
+  // Catálogo
+  const product_code = String(body.product_code ?? prod.product_code).trim().toUpperCase();
+  const name = String(body.name ?? prod.name).trim();
+  const category = String(body.category ?? prod.category).trim();
 
-  const lead_time_days = Math.max(0, Math.floor(Number(body.lead_time_days ?? existingProduct.lead_time_days)));
-  const units_per_pack = Math.max(1, Math.floor(Number(body.units_per_pack ?? existingProduct.units_per_pack)));
-  const min_packs_order = Math.max(1, Math.floor(Number(body.min_packs_order ?? existingProduct.min_packs_order)));
+  const lead_time_days = Math.max(0, Math.floor(Number(body.lead_time_days ?? prod.lead_time_days)));
+  const units_per_pack = Math.max(1, Math.floor(Number(body.units_per_pack ?? prod.units_per_pack)));
+  const min_packs_order = Math.max(1, Math.floor(Number(body.min_packs_order ?? prod.min_packs_order)));
 
-  // -------------------------
-  // 2) Actualizar por sucursal (branch_products)
-  // -------------------------
-  const current_stock_packs = Math.max(0, Math.floor(Number(body.current_stock_packs ?? existingBP.current_stock_packs ?? 0)));
-  const margin_minimum_packs = Math.max(0, Math.floor(Number(body.margin_minimum_packs ?? existingBP.margin_minimum_packs ?? 0)));
-
-  const active = normalizeActive(body.active, Number(existingBP.active ?? 1));
+  // Por sucursal
+  const current_stock_packs = Math.max(0, Math.floor(Number(body.current_stock_packs ?? bp.current_stock_packs)));
+  const margin_minimum_packs = Math.max(0, Math.floor(Number(body.margin_minimum_packs ?? bp.margin_minimum_packs)));
 
   const start_date =
     body.start_date === undefined
-      ? (existingBP.start_date ? String(existingBP.start_date) : null)
+      ? (bp.start_date ? String(bp.start_date) : null)
       : normalizeYmdOrNull(body.start_date);
 
   const end_date =
     body.end_date === undefined
-      ? (existingBP.end_date ? String(existingBP.end_date) : null)
+      ? (bp.end_date ? String(bp.end_date) : null)
       : normalizeYmdOrNull(body.end_date);
 
-  // Validación start <= end
   if (start_date && end_date && start_date > end_date) {
     return NextResponse.json({ error: "La fecha de inicio no puede ser mayor a la fecha de fin" }, { status: 400 });
   }
 
-  // Regla: si end_date ya pasó => forzar inactive (sin reprogramar)
-  const finalActive = end_date && end_date < today ? 0 : active;
+  let active = normalizeActive(body.active, Number(bp.active ?? 1));
+  if (end_date && end_date < today) active = 0; // vencido => inactivo
 
   try {
-    db.transaction(() => {
-      // Catálogo
+    const tx = db.transaction(() => {
       db.prepare(`
         UPDATE products SET
           product_code = ?,
@@ -144,71 +123,47 @@ export async function PUT(req: Request, { params }: { params: { id: string } }) 
           min_packs_order = ?,
           updated_at = ?
         WHERE id = ?
-      `).run(
-        product_code,
-        name,
-        category,
-        lead_time_days,
-        units_per_pack,
-        min_packs_order,
-        now,
-        productId
-      );
+      `).run(product_code, name, category, lead_time_days, units_per_pack, min_packs_order, now, productId);
 
-      // Por sucursal
       db.prepare(`
         UPDATE branch_products SET
-          current_stock_packs = ?,
-          margin_minimum_packs = ?,
           active = ?,
           start_date = ?,
           end_date = ?,
+          current_stock_packs = ?,
+          margin_minimum_packs = ?,
           updated_at = ?
         WHERE branch_id = ? AND product_id = ?
-      `).run(
-        current_stock_packs,
-        margin_minimum_packs,
-        finalActive,
-        start_date,
-        end_date,
-        now,
-        branchId,
-        productId
-      );
-    })();
+      `).run(active, start_date, end_date, current_stock_packs, margin_minimum_packs, now, branchId, productId);
+    });
 
-    return NextResponse.json({ ok: true });
+    tx();
+    return NextResponse.json({ ok: true, branchId });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || "Error" }, { status: 400 });
   }
 }
 
-export async function DELETE(req: Request, { params }: { params: { id: string } }) {
+export async function DELETE(_req: Request, { params }: { params: { id: string } }) {
   const user = getSessionUser();
-  if (!user || user.role !== "OWNER") return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  if (!user || user.role !== "OWNER") {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
 
   const productId = Number(params.id);
-  if (!Number.isFinite(productId)) return NextResponse.json({ error: "Bad id" }, { status: 400 });
+  if (!Number.isFinite(productId)) {
+    return NextResponse.json({ error: "Bad id" }, { status: 400 });
+  }
 
   const db = getDb();
-  const now = nowIso();
+  const prod = db.prepare("SELECT id FROM products WHERE id = ?").get(productId) as any;
+  if (!prod) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  // branchId: por query; default 1
-  const url = new URL(req.url);
-  const branchId = parseBranchId(url.searchParams.get("branchId")) ?? 1;
+  const tx = db.transaction(() => {
+    db.prepare("DELETE FROM branch_products WHERE product_id = ?").run(productId);
+    db.prepare("DELETE FROM products WHERE id = ?").run(productId);
+  });
 
-  // Si no existe el producto, 404
-  const existingProduct = db.prepare("SELECT id FROM products WHERE id = ?").get(productId) as any;
-  if (!existingProduct) return NextResponse.json({ error: "Not found" }, { status: 404 });
-
-  // Garantiza row en branch_products y luego lo desactiva para ESA sucursal
-  ensureBranchProductRow(db, branchId, productId);
-
-  db.prepare(`
-    UPDATE branch_products
-    SET active = 0, start_date = NULL, end_date = NULL, updated_at = ?
-    WHERE branch_id = ? AND product_id = ?
-  `).run(now, branchId, productId);
-
+  tx();
   return NextResponse.json({ ok: true });
 }

@@ -11,16 +11,21 @@ let db: Database.Database | null = null;
 
 export function getDb() {
   if (db) return db;
+
   const dir = path.dirname(DB_PATH);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
   db = new Database(DB_PATH);
   db.pragma("journal_mode = WAL");
+
   init(db);
   return db;
 }
 
 function init(d: Database.Database) {
-  // TABLAS BASE (compatibles con lo que ya tenés)
+  // ---------------------------
+  // TABLAS BASE (legacy-friendly)
+  // ---------------------------
   d.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,24 +77,35 @@ function init(d: Database.Database) {
     );
   `);
 
-  // ✅ MIGRACIONES (para DBs ya creadas)
+  // ---------------------------
+  // MIGRACIONES (DBs ya creadas)
+  // ---------------------------
   ensureProductsColumns(d);
-  ensureBranchSchema(d);           // branches + branch_products
-  ensureUsersBranchColumn(d);      // users.branch_id
-  ensureBranchIdInEntries(d);      // stock_entries.branch_id + alert_logs.branch_id
+  ensureBranchSchema(d);       // branches + branch_products
+  ensureUsersBranchColumn(d);  // users.branch_id
+  ensureBranchIdInEntries(d);  // stock_entries.branch_id + alert_logs.branch_id
 
-  // ✅ Seed branches + branch_products
+  // ---------------------------
+  // SEEDS + BACKFILLS
+  // ---------------------------
   seedBranchesIfMissing(d);
+
+  // crea branch_products si está vacío (primera vez)
   seedBranchProductsIfMissing(d);
 
-  // ✅ Seed users si vacío (nuevo proyecto)
+  // ✅ completa siempre las combinaciones faltantes (si agregás productos o sucursales)
+  ensureBranchProductsCoverage(d);
+
+  // crea usuarios si users está vacío
   seedUsersIfEmpty(d);
 
-  // ✅ Backfill para DBs existentes (TU CASO)
+  // ✅ asegura que empleados existentes tengan branch_id
   backfillEmployeeBranches(d);
 }
 
-/* ----------------------------- Helpers MIGRATION ---------------------------- */
+/* ===========================
+   Helpers MIGRATION
+=========================== */
 
 function columnExists(d: Database.Database, table: string, column: string): boolean {
   const cols = d.prepare(`PRAGMA table_info(${table})`).all() as any[];
@@ -160,7 +176,9 @@ function ensureBranchIdInEntries(d: Database.Database) {
   }
 }
 
-/* ---------------------------------- Seeds --------------------------------- */
+/* ===========================
+   Seeds
+=========================== */
 
 function seedBranchesIfMissing(d: Database.Database) {
   const now = nowIso();
@@ -175,7 +193,6 @@ function seedBranchesIfMissing(d: Database.Database) {
 
 function seedBranchProductsIfMissing(d: Database.Database) {
   const now = nowIso();
-
   const count = d.prepare("SELECT COUNT(*) as c FROM branch_products").get() as any;
   if ((count?.c ?? 0) > 0) return;
 
@@ -208,16 +225,57 @@ function seedBranchProductsIfMissing(d: Database.Database) {
   }
 }
 
+/**
+ * ✅ CLAVE: si branch_products ya existe pero está “incompleto”
+ * (por ejemplo, agregaste productos nuevos), completa TODO lo faltante.
+ */
+function ensureBranchProductsCoverage(d: Database.Database) {
+  const now = nowIso();
+
+  const branches = d.prepare("SELECT id FROM branches ORDER BY id ASC").all() as any[];
+  const products = d.prepare(`
+    SELECT id, active, start_date, end_date, current_stock_packs, margin_minimum_packs
+    FROM products
+    ORDER BY id ASC
+  `).all() as any[];
+
+  const exists = d.prepare(`SELECT 1 FROM branch_products WHERE branch_id = ? AND product_id = ?`);
+  const ins = d.prepare(`
+    INSERT INTO branch_products
+      (branch_id, product_id, active, start_date, end_date, current_stock_packs, margin_minimum_packs, updated_at)
+    VALUES (?,?,?,?,?,?,?,?)
+  `);
+
+  for (const b of branches) {
+    for (const p of products) {
+      if (exists.get(b.id, p.id)) continue;
+
+      ins.run(
+        b.id,
+        p.id,
+        p.active ?? 1,
+        p.start_date ?? null,
+        p.end_date ?? null,
+        p.current_stock_packs ?? 0,
+        p.margin_minimum_packs ?? 0,
+        now
+      );
+    }
+  }
+}
+
 function seedUsersIfEmpty(d: Database.Database) {
   const userCount = d.prepare("SELECT COUNT(*) as c FROM users").get() as any;
   if ((userCount?.c ?? 0) !== 0) return;
 
   const now = nowIso();
 
+  // Owner (único)
   const ownerUser = process.env.SEED_OWNER_USER || "owner";
   const ownerPass = process.env.SEED_OWNER_PASSWORD || "56789";
   const ownerEmail = process.env.OWNER_EMAIL || "valentinelio04@gmail.com";
 
+  // Empleados por sucursal (editables por env)
   const b1User = process.env.SEED_BRANCH1_USER || "sucursal1";
   const b1Pass = process.env.SEED_BRANCH1_PASS || "12345";
 
@@ -234,11 +292,15 @@ function seedUsersIfEmpty(d: Database.Database) {
     VALUES (?,?,?,?,?,?)
   `);
 
+  // owner: branch_id null
   ins.run(ownerUser, bcrypt.hashSync(ownerPass, 10), "OWNER", ownerEmail, now, null);
+
+  // empleados: branch_id 1/2/3
   ins.run(b1User, bcrypt.hashSync(b1Pass, 10), "EMPLEADO", bakeryEmail, now, 1);
   ins.run(b2User, bcrypt.hashSync(b2Pass, 10), "EMPLEADO", bakeryEmail, now, 2);
   ins.run(b3User, bcrypt.hashSync(b3Pass, 10), "EMPLEADO", bakeryEmail, now, 3);
 
+  // compatibilidad con usuario viejo "empleado"
   const keepLegacy = (process.env.KEEP_LEGACY_EMPLEADO ?? "1") === "1";
   if (keepLegacy) {
     const legacyUser = "empleado";
@@ -246,21 +308,22 @@ function seedUsersIfEmpty(d: Database.Database) {
     try {
       ins.run(legacyUser, bcrypt.hashSync(legacyPass, 10), "EMPLEADO", bakeryEmail, now, 1);
     } catch {
-      // ya existía
+      // si ya existía, ignoramos
     }
   }
 }
 
-/* ------------------------------ Backfill FIX ------------------------------- */
+/* ===========================
+   Backfill
+=========================== */
 
 function backfillEmployeeBranches(d: Database.Database) {
-  // Esto arregla el error actual: empleados sin branch_id
-  // 1) Setear branch_id para usuarios conocidos sucursal1/2/3/empleado si están NULL
+  // setea branch_id para empleados conocidos si está null/vacío
   const mapping: Array<{ username: string; branch_id: number }> = [
     { username: process.env.SEED_BRANCH1_USER || "sucursal1", branch_id: 1 },
     { username: process.env.SEED_BRANCH2_USER || "sucursal2", branch_id: 2 },
     { username: process.env.SEED_BRANCH3_USER || "sucursal3", branch_id: 3 },
-    { username: "empleado", branch_id: 1 }, // legacy
+    { username: "empleado", branch_id: 1 },
   ];
 
   const upd = d.prepare(`
@@ -272,11 +335,14 @@ function backfillEmployeeBranches(d: Database.Database) {
   `);
 
   for (const m of mapping) {
-    try { upd.run(m.branch_id, m.username); } catch {}
+    try {
+      upd.run(m.branch_id, m.username);
+    } catch {
+      // ignore
+    }
   }
 
-  // 2) (Opcional pero muy útil) cualquier EMPLEADO sin branch_id => sucursal 1
-  // Si preferís NO hacerlo, borrá este bloque.
+  // fallback: cualquier EMPLEADO sin branch_id => sucursal 1
   d.prepare(`
     UPDATE users
     SET branch_id = 1
@@ -285,7 +351,9 @@ function backfillEmployeeBranches(d: Database.Database) {
   `).run();
 }
 
-/* ---------------------------------- Utils --------------------------------- */
+/* ===========================
+   Utils
+=========================== */
 
 export function nowIso() {
   return new Date().toISOString();

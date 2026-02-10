@@ -13,9 +13,7 @@ function escapeHtml(s: string) {
 }
 
 function fmtOwnerMail(items: any[]) {
-  const blocks = items
-    .map(
-      (it) => `
+  const blocks = items.map((it) => `
     <div style="margin:20px 0;">
       <div><b>Producto:</b> ${escapeHtml(it.name)} (${escapeHtml(it.product_code)})</div>
       <div><b>Stock actual:</b> ${it.stock_packs}</div>
@@ -23,9 +21,7 @@ function fmtOwnerMail(items: any[]) {
       <div><b>Reabastecer al menos:</b> ${it.replenish_packs}</div>
       <div><b>Mínimo por pedido (min_packs_pedido):</b> ${it.min_packs_order}</div>
     </div>
-  `
-    )
-    .join("");
+  `).join("");
 
   return `
     <h2>ALERTA DE STOCK</h2>
@@ -35,11 +31,17 @@ function fmtOwnerMail(items: any[]) {
 }
 
 function fmtEmployeeMail(items: any[]) {
-  // Empleado: SIMPLE (solo producto + reabastecer)
-  const lines = items
-    .map((it) => `• ${escapeHtml(it.name)}: reabastecer ${it.replenish_packs} packs`)
-    .join("<br/>");
+  const lines = items.map((it) => `• ${escapeHtml(it.name)}: reabastecer ${it.replenish_packs} packs`).join("<br/>");
   return `<h3>Reabastecer (packs)</h3><p>${lines}</p>`;
+}
+
+function getUserBranchId(user: any): number | null {
+  const b =
+    (typeof user?.branch_id === "number" ? user.branch_id : null) ??
+    (typeof user?.branchId === "number" ? user.branchId : null);
+
+  if (!b || !Number.isFinite(b)) return null;
+  return b;
 }
 
 export async function POST(req: Request) {
@@ -48,15 +50,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  // branchId del empleado (viene de users.branch_id y lo guardás en la sesión)
-  // Nota: tu SessionUser actual probablemente tiene branchId, no branch_id.
-  // Soportamos ambos para no romper.
-  const branchId =
-    // @ts-ignore
-    (typeof user.branchId === "number" ? user.branchId : null) ??
-    // @ts-ignore
-    (typeof user.branch_id === "number" ? user.branch_id : null);
-
+  const branchId = getUserBranchId(user);
   if (!branchId) {
     return NextResponse.json({ error: "Empleado sin sucursal asignada (branch_id)" }, { status: 400 });
   }
@@ -70,8 +64,6 @@ export async function POST(req: Request) {
   const date = yyyyMmDd(new Date());
   const today = todayYMD();
 
-  // Traemos SOLO productos "visibles" en esta sucursal:
-  // active=1 y dentro de start/end
   const getVisibleProduct = db.prepare(`
     SELECT
       p.id as id,
@@ -102,7 +94,6 @@ export async function POST(req: Request) {
     WHERE branch_id = ? AND product_id = ?
   `);
 
-  // stock_entries ahora incluye branch_id (según tu db.ts migrado)
   const insertEntry = db.prepare(`
     INSERT INTO stock_entries
       (product_id, stock_packs, recorded_by, recorded_at, recorded_date, branch_id)
@@ -111,38 +102,31 @@ export async function POST(req: Request) {
 
   const changed: any[] = [];
 
-  // Hacemos todo en transacción para consistencia
-  const tx = db.transaction(() => {
+  db.transaction(() => {
     for (const it of items) {
       const productId = Number(it.productId);
       if (!Number.isFinite(productId)) continue;
 
-      // Opción B: viene parcial, solo los que completó el usuario
-      const stockPacks = Math.max(0, Math.floor(Number(it.stockPacks)));
+      const raw = it.stockPacks ?? 0;
+      const stockPacks = Math.max(0, Math.floor(Number(raw)));
+      if (!Number.isFinite(stockPacks)) continue;
 
       const p = getVisibleProduct.get(branchId, productId, today, today) as any;
       if (!p) continue;
 
-      // Si no cambió, no hacemos nada
       if (Number(p.current_stock_packs) === stockPacks) continue;
 
       updateBranchStock.run(stockPacks, now, branchId, productId);
       insertEntry.run(productId, stockPacks, user.id, now, date, branchId);
 
-      changed.push({
-        ...p,
-        stock_packs: stockPacks,
-      });
+      changed.push({ ...p, stock_packs: stockPacks });
     }
-  });
-
-  tx();
+  })();
 
   if (changed.length === 0) {
     return NextResponse.json({ message: "No hay cambios para guardar." });
   }
 
-  // Calcular alertas usando MARGEN por sucursal y MIN PACKS ORDER del catálogo
   const alerts = changed
     .map((p) => {
       const status = computeStatus(p.stock_packs, p.margin_minimum_packs);
@@ -151,7 +135,6 @@ export async function POST(req: Request) {
     })
     .filter((p) => p.status === "ALERTA" && p.replenish_packs > 0);
 
-  // Evitar spam: log por sucursal + producto dentro de 24h
   const recentLog = db.prepare(`
     SELECT COUNT(*) as c
     FROM alert_logs
@@ -167,7 +150,7 @@ export async function POST(req: Request) {
 
   const toNotify: any[] = [];
   for (const a of alerts) {
-    const c = (recentLog.get(branchId, a.id) as any)?.c as number;
+    const c = Number((recentLog.get(branchId, a.id) as any)?.c ?? 0);
     if (c > 0) continue;
     toNotify.push(a);
   }
@@ -201,16 +184,7 @@ export async function POST(req: Request) {
     const sentTo = JSON.stringify({ owner: recipientsOwner, employee: recipientsEmployee, branchId });
 
     for (const a of toNotify) {
-      insertLog.run(
-        branchId,
-        a.id,
-        a.stock_packs,
-        a.margin_minimum_packs,
-        a.replenish_packs,
-        sentTo,
-        "EMPLOYEE_SAVE",
-        now
-      );
+      insertLog.run(branchId, a.id, a.stock_packs, a.margin_minimum_packs, a.replenish_packs, sentTo, "EMPLOYEE_SAVE", now);
     }
   }
 
